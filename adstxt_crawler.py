@@ -1,6 +1,7 @@
 #!/usr/bin/env python
+# encoding=utf8
 
-########################################################################################################
+##########################################################################
 # Copyright 2017 Hebbian Labs, LLC
 # Copyright 2017 IAB TechLab & OpenRTB Group
 #
@@ -23,10 +24,10 @@
 # HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
 # NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
-########################################################################################################
+##########################################################################
 
 
-########################################################################################################
+##########################################################################
 # See README.md file
 #
 # This is a reference implemenation of an ads.txt crawler that downloads, parses and dumps the data to a SQLiteDB
@@ -37,17 +38,23 @@
 # of target servers being down, usage of a real production DB server etc.  Use as a reference for your own
 # implementations or harden and enhance this code as needed.
 #
-########################################################################################################
+##########################################################################
 
 import sys
 import csv
+import pycurl
 import socket
 import sqlite3
+import threading
+import Queue
 import logging
 from optparse import OptionParser
 from urlparse import urlparse
-#pip install requests
-import requests
+from string import join
+from string import split
+
+reload(sys)
+sys.setdefaultencoding('utf8')
 
 #################################################################
 # FUNCTION process_row_to_db.
@@ -55,53 +62,71 @@ import requests
 #
 #################################################################
 
-def process_row_to_db(conn, data_row, comment, hostname):
-    insert_stmt = "INSERT OR IGNORE INTO adstxt (SITE_DOMAIN, EXCHANGE_DOMAIN, SELLER_ACCOUNT_ID, ACCOUNT_TYPE, TAG_ID, ENTRY_COMMENT) VALUES (?, ?, ?, ?, ?, ? );"
-    exchange_host     = ''
-    seller_account_id = ''
-    account_type      = ''
-    tag_id            = ''
 
-    if len(data_row) >= 3:
-        exchange_host     = data_row[0].lower()
-        seller_account_id = data_row[1].lower()
-        account_type      = data_row[2].lower()
+def process_row_to_db(conn, data_row, hostname):
+  insert_stmt = "INSERT OR REPLACE INTO adstxt (SITE_DOMAIN, EXCHANGE_DOMAIN, SELLER_ACCOUNT_ID, ACCOUNT_TYPE, TAG_ID) VALUES (?, ?, ?, ?, ?);"
+  exchange_host = ''
+  seller_account_id = ''
+  account_type = ''
+  tag_id = ''
 
-    if len(data_row) == 4:
-        tag_id            = data_row[3].lower()
+  if len(data_row) >= 3:
+    exchange_host = data_row[0].strip()
+    seller_account_id = data_row[1].strip()
+    account_type = data_row[2].lower().strip()
 
-    #data validation heurstics
-    data_valid = 1;
+  if len(data_row) == 4:
+    tag_id = data_row[3].strip()
 
-    # Minimum length of a domain name is 1 character, not including extensions.
-    # Domain Name Rules - Nic AG
-    # www.nic.ag/rules.htm
-    if(len(hostname) < 3):
-        data_valid = 0
+  if "#" in account_type or tag_id.startswith('#'):
+    tag_id = ''
+  if "#" in tag_id:
+    tag_id = tag_id.rsplit('#', 1)[0]
 
-    if(len(exchange_host) < 3):
-        data_valid = 0
+  tag_id = tag_id.strip()
 
-    # could be single digit integers
-    if(len(seller_account_id) < 1):
-        data_valid = 0
+  if "direct" in account_type:
+    account_type = 'DIRECT'
+  elif "reseller" in account_type:
+    account_type = 'RESELLER'
 
-    ## ads.txt supports 'DIRECT' and 'RESELLER'
-    if(len(account_type) < 6):
-        data_valid = 0
+  # data validation heurstics
+  data_valid = 1
 
-    if(data_valid > 0):
-        logging.debug( "%s | %s | %s | %s | %s | %s" % (hostname, exchange_host, seller_account_id, account_type, tag_id, comment))
+  # Minimum length of a domain name is 1 character, not including extensions.
+  # Domain Name Rules - Nic AG
+  # www.nic.ag/rules.htm
+  if(len(hostname) < 3):
+    data_valid = 0
 
-        # Insert a row of data using bind variables (protect against sql injection)
-        c = conn.cursor()
-        c.execute(insert_stmt, (hostname, exchange_host, seller_account_id, account_type, tag_id, comment))
+  if(len(exchange_host) < 3):
+    data_valid = 0
 
-        # Save (commit) the changes
-        conn.commit()
-        return 1
+  # could be single digit integers
+  if(len(seller_account_id) < 1):
+    data_valid = 0
 
-    return 0
+  # ads.txt supports 'DIRECT' and 'RESELLER'
+  if(len(account_type) < 6):
+    data_valid = 0
+
+  if(data_valid > 0):
+    logging.debug("%s | %s | %s | %s | %s" % (
+        hostname, exchange_host, seller_account_id, account_type, tag_id))
+
+    # Insert a row of data using bind variables (protect against sql injection)
+    c = conn.cursor()
+    try:
+      c.execute(insert_stmt, (hostname, exchange_host,
+                              seller_account_id, account_type, tag_id))
+      # Save (commit) the changes
+      conn.commit()
+    except sqlite3.Error as e:
+      print "An error occurred:", e.args[0]
+
+    return 1
+
+  return 0
 
 # end process_row_to_db  #####
 
@@ -111,66 +136,44 @@ def process_row_to_db(conn, data_row, comment, hostname):
 #
 #################################################################
 
+
 def crawl_to_db(conn, crawl_url_queue):
 
-    rowcnt = 0
+  rowcnt = 0
 
-    myheaders = {
-            'User-Agent': 'AdsTxtCrawler/1.0; +https://github.com/InteractiveAdvertisingBureau/adstxtcrawler',
-            'Accept': 'text/plain',
-        }
+  myheaders = {
+      'User-Agent': 'AdsTxtCrawler/1.0; + https://github.com/InteractiveAdvertisingBureau/adstxtcrawler',
+      'Accept': 'text/plain',
+  }
 
-    for aurl in crawl_url_queue:
-        ahost = crawl_url_queue[aurl]
-        logging.info(" Crawling  %s : %s " % (aurl, ahost))
-        r = requests.get(aurl, headers=myheaders)
-        logging.info("  %d" % r.status_code)
+  for aurl in crawl_url_queue:
+    ahost = crawl_url_queue[aurl]
+    logging.info(" Crawling  %s : %s " % (aurl, ahost))
+    r = requests.get(aurl, headers=myheaders)
+    logging.info("  %d" % r.status_code)
 
-        if(r.status_code == 200):
-            logging.debug("-------------")
-            logging.debug(r.request.headers)
-            logging.debug("-------------")
-            logging.debug("%s" % r.text)
-            logging.debug("-------------")
+    if(r.status_code == 200):
+      logging.debug("-------------")
+      logging.debug(r.request.headers)
+      logging.debug("-------------")
+      logging.debug("%s" % r.text)
+      logging.debug("-------------")
 
-            tmpfile = 'tmpads.txt'
-            with open(tmpfile, 'wb') as tmp_csv_file:
-                tmp_csv_file.write(r.text)
-                tmp_csv_file.close()
+      tmpfile = 'tmpads.txt'
+      with open(tmpfile, 'wb') as tmp_csv_file:
+        tmp_csv_file.write(r.text)
+        tmp_csv_file.close()
 
-            with open(tmpfile, 'rb') as tmp_csv_file:
-                #read the line, split on first comment and keep what is to the left (if any found)
-                line_reader = csv.reader(tmp_csv_file, delimiter='#', quotechar='|')
-                comment = ''
+      with open(tmpfile, 'rU') as tmp_csv_file:
+        data_reader = csv.reader(
+            tmp_csv_file, delimiter=',', quotechar='|', strict=False)
 
-                for line in line_reader:
-                    logging.debug("DATA:  %s" % line)
+        for row in data_reader:
+          if len(row) == 0 or row[0].startswith('#'):
+            continue
 
-                    try:
-                        data_line = line[0]
-                    except:
-                        data_line = "";
-
-                    #determine delimiter, conservative = do it per row
-                    if data_line.find(",") != -1:
-                        data_delimiter = ','
-                    elif data_line.find("\t") != -1:
-                        data_delimiter = '\t'
-                    else:
-                        data_delimiter = ' '
-
-                    data_reader = csv.reader([data_line], delimiter=',', quotechar='|')
-                    for row in data_reader:
-
-                        if len(row) > 0 and row[0].startswith( '#' ):
-                            continue
-
-                        if (len(line) > 1) and (len(line[1]) > 0):
-                             comment = line[1]
-
-                        rowcnt = rowcnt + process_row_to_db(conn, row, comment, ahost)
-
-    return rowcnt
+          rowcnt = rowcnt + process_row_to_db(conn, row, ahost)
+  return rowcnt
 
 # end crawl_to_db  #####
 
@@ -180,93 +183,166 @@ def crawl_to_db(conn, crawl_url_queue):
 #
 #################################################################
 
+
 def load_url_queue(csvfilename, url_queue):
-    cnt = 0
+  cnt = 0
 
-    with open(csvfilename, 'rb') as csvfile:
-        targets_reader = csv.reader(csvfile, delimiter=',', quotechar='|')
-        for row in targets_reader:
+  with open(csvfilename, 'rb') as csvfile:
+    targets_reader = csv.reader(csvfile, delimiter=',', quotechar='|')
+    for row in targets_reader:
 
-            if len(row) < 1 or row[0].startswith( '#' ):
-                continue
+      if len(row) < 1 or row[0].startswith('#'):
+        continue
 
-            for item in row:
-                host = "localhost"
+      for item in row:
+        host = "localhost"
 
-                if  "http:" in item or "https:" in item :
-                    logging.info( "URL: %s" % item)
-                    parsed_uri = urlparse(row[0])
-                    host = parsed_uri.netloc
-                else:
-                    host = item
-                    logging.info( "HOST: %s" % item)
+        if "http:" in item or "https:" in item:
+          logging.info("URL: %s" % item)
+          parsed_uri = urlparse(row[0])
+          host = parsed_uri.netloc
+        else:
+          host = item
+          logging.info("HOST: %s" % item)
 
-            skip = 0
+      ads_txt_url = 'http://{thehost}/ads.txt'.format(thehost=host)
+      logging.info("  pushing %s" % ads_txt_url)
+      filename = "adstxt_%03d.txt" % (len(queue.queue) + 1)
+      queue.put((ads_txt_url, filename))
+      cnt = cnt + 1
 
-            try:
-                #print "Checking DNS: %s" % host
-                ip = socket.gethostbyname(host)
-
-                if "127.0.0" in ip:
-                    skip = 0 #swap to 1 to skip localhost testing
-                elif "0.0.0.0" in ip:
-                    skip = 1
-                else:
-                    logging.info("  Validated Host IP: %s" % ip)
-            except:
-                skip = 1
-
-            if(skip < 1):
-                ads_txt_url = 'http://{thehost}/ads.txt'.format(thehost=host)
-                logging.info("  pushing %s" % ads_txt_url)
-                url_queue[ads_txt_url] = host
-                cnt = cnt + 1
-
-    return cnt
+  return cnt
 
 # end load_url_queue  #####
+
+
+class WorkerThread(threading.Thread):
+
+  def __init__(self, queue):
+    threading.Thread.__init__(self)
+    self.queue = queue
+
+  def run(self):
+    if options.target_database and (len(options.target_database) > 1):
+      try:
+        conn = sqlite3.connect(options.target_database)
+        conn.text_factory = str
+      except sqlite3.Error as e:
+        print "An error occurred:", e.args[0]
+    while 1:
+      try:
+        url, filename = self.queue.get_nowait()
+      except Queue.Empty:
+        conn.commit()
+        conn.close()
+        raise SystemExit
+      retrieved_headers = Storage()
+      retrieved_body = Storage()
+      curl = pycurl.Curl()
+      curl.setopt(pycurl.URL, url)
+      curl.setopt(pycurl.USERAGENT, "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/62.0.3202.62 Safari/537.36")
+      curl.setopt(pycurl.ENCODING, 'gzip')
+      curl.setopt(pycurl.FOLLOWLOCATION, 1)
+      curl.setopt(pycurl.MAXREDIRS, 5)
+      curl.setopt(pycurl.CONNECTTIMEOUT, 30)
+      curl.setopt(pycurl.TIMEOUT, 300)
+      curl.setopt(pycurl.NOSIGNAL, 1)
+      curl.setopt(pycurl.WRITEFUNCTION, retrieved_body.store)
+      curl.setopt(pycurl.HEADERFUNCTION, retrieved_headers.store)
+      try:
+        print "Curling %s" % url
+        curl.perform()
+        effective_url = curl.getinfo(pycurl.EFFECTIVE_URL)
+        status_code = curl.getinfo(pycurl.HTTP_CODE)
+        if(status_code == 200):
+          logging.debug("-------------")
+          logging.debug("%s" % effective_url)
+          logging.debug("-------------")
+          logging.debug(retrieved_headers)
+          logging.debug("-------------")
+          logging.debug("%s" % retrieved_body)
+          logging.debug("-------------")
+
+          if not effective_url.endswith("ads.txt"):
+            continue;
+
+          tmpfile = filename
+          with open(tmpfile, 'wb') as tmp_csv_file:
+            tmp_csv_file.write("%s" % retrieved_body)
+            tmp_csv_file.close()
+
+          if "<html" in "%s" % retrieved_body:
+            continue
+
+          with open(filename, 'rU') as tmp_csv_file:
+            data_reader = csv.reader(
+                tmp_csv_file, delimiter=',', quotechar='|', strict=False)
+
+            for row in data_reader:
+              if len(row) == 0 or row[0].startswith('#'):
+                continue
+
+              #rowcnt = rowcnt +
+              process_row_to_db(conn, row, url)
+      except:
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+      curl.close()
+      sys.stdout.write(".")
+      sys.stdout.flush()
+
+class Storage:
+  def __init__(self):
+    self.contents = ''
+    self.line = 0
+
+  def store(self, buf):
+    self.line = self.line + 1
+    self.contents = "%s%i: %s" % (self.contents, self.line, buf)
+
+  def __str__(self):
+    return self.contents
 
 #### MAIN ####
 
 arg_parser = OptionParser()
 arg_parser.add_option("-t", "--targets", dest="target_filename",
-                  help="list of domains to crawl ads.txt from", metavar="FILE")
+                      help="list of domains to crawl ads.txt from", metavar="FILE")
 arg_parser.add_option("-d", "--database", dest="target_database",
-                  help="Database to dump crawled data into", metavar="FILE")
+                      help="Database to dump crawled data into", metavar="FILE")
 arg_parser.add_option("-v", "--verbose", dest="verbose", action='count',
-                  help="Increase verbosity (specify multiple times for more)")
+                      help="Increase verbosity (specify multiple times for more)")
 
 (options, args) = arg_parser.parse_args()
 
-if len(sys.argv)==1:
-    arg_parser.print_help()
-    exit(1)
+if len(sys.argv) == 1:
+  arg_parser.print_help()
+  exit(1)
 
-log_level = logging.WARNING # default
+log_level = logging.WARNING  # default
 if options.verbose == 1:
-    log_level = logging.INFO
+  log_level = logging.INFO
 elif options.verbose >= 2:
-    log_level = logging.DEBUG
-logging.basicConfig(filename='adstxt_crawler.log',level=log_level,format='%(asctime)s %(filename)s:%(lineno)d:%(levelname)s  %(message)s')
+  log_level = logging.DEBUG
+logging.basicConfig(filename='adstxt_crawler.log', level=log_level,
+                    format='%(asctime)s %(filename)s:%(lineno)d:%(levelname)s  %(message)s')
 
 crawl_url_queue = {}
-conn = None
 cnt_urls = 0
 cnt_records = 0
 
-cnt_urls = load_url_queue(options.target_filename, crawl_url_queue)
+queue = Queue.Queue()
 
-if (cnt_urls > 0) and options.target_database and (len(options.target_database) > 1):
-    conn = sqlite3.connect(options.target_database)
+cnt_urls = load_url_queue(options.target_filename, queue)
 
-with conn:
-    cnt_records = crawl_to_db(conn, crawl_url_queue)
-    if(cnt_records > 0):
-        conn.commit()
-    #conn.close()
+threads = []
+for dummy in range(20):
+  t = WorkerThread(queue)
+  t.start()
+  threads.append(t)
 
-print "Wrote %d records from %d URLs to %s" % (cnt_records, cnt_urls, options.target_database)
+for thread in threads:
+  thread.join()
 
-logging.warning("Wrote %d records from %d URLs to %s" % (cnt_records, cnt_urls, options.target_database))
 logging.warning("Finished.")
-

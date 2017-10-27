@@ -14,12 +14,12 @@ Options:
                         Database to dump crawlered data into
   -v, --verbose         Increase verbosity (specify multiple times for more)
 ```
-## Targets File 
+## Targets File
 
 The targets file can be a list of domains, URLs etc.  For each line the crawler with extract the full hostname, validate it and cause a request to http://HOSTNAME/ads.txt
 
 ``` bash
-$ cat target_domains.txt 
+$ cat target_domains.txt
 #https://chicagotribune.com
 #http://latimes.com/sports
 #washingtonpost.com
@@ -32,12 +32,12 @@ localhosttribune.com
 The project depends on these libraries and programs installed
 
 * Python 2 or better
-* Python HTTP Requests libary (pip install requests)
+* PyCurl Library (pip install pycurl)
 * sqlite3
 
-Execute this command to install the DB table 
+Execute this command to install the DB table
 ``` bash
-$sqlite3 adstxt.db < adstxt_crawler.sql 
+./reinit.sh
 ```
 
 ## Running
@@ -60,7 +60,7 @@ You can clear the DB records as follows:
 $echo "delete from adstxt;" | sqlite3 adstxt.db
 ```
 
-## Warnings 
+## Warnings
 
 This is an example prototype crawler and would be suitable only for a very modest production usage.  It doesn't contain a lot of niceties of a production crawler, such as parallel HTTP download and parsing of the data files, stateful recovery of target servers being down, usage of a real production DB server etc.
 
@@ -71,4 +71,3 @@ Initial author is Neal Richter (neal@hebbian.io)
 ## License
 
 The open source license used is the 2-clause BSD license
-
