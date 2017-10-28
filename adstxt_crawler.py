@@ -63,7 +63,7 @@ sys.setdefaultencoding('utf8')
 #################################################################
 
 
-def process_row_to_db(conn, data_row, hostname):
+def process_row_to_db(conn, data_row, crawl):
   insert_stmt = "INSERT OR REPLACE INTO adstxt (SITE_DOMAIN, EXCHANGE_DOMAIN, SELLER_ACCOUNT_ID, ACCOUNT_TYPE, TAG_ID) VALUES (?, ?, ?, ?, ?);"
   exchange_host = ''
   seller_account_id = ''
@@ -96,7 +96,7 @@ def process_row_to_db(conn, data_row, hostname):
   # Minimum length of a domain name is 1 character, not including extensions.
   # Domain Name Rules - Nic AG
   # www.nic.ag/rules.htm
-  if(len(hostname) < 3):
+  if(len(crawl.hostname) < 3):
     data_valid = 0
 
   if(len(exchange_host) < 3):
@@ -112,12 +112,12 @@ def process_row_to_db(conn, data_row, hostname):
 
   if(data_valid > 0):
     logging.debug("%s | %s | %s | %s | %s" % (
-        hostname, exchange_host, seller_account_id, account_type, tag_id))
+        crawl.hostname, exchange_host, seller_account_id, account_type, tag_id))
 
     # Insert a row of data using bind variables (protect against sql injection)
     c = conn.cursor()
     try:
-      c.execute(insert_stmt, (hostname, exchange_host,
+      c.execute(insert_stmt, (crawl.hostname, exchange_host,
                               seller_account_id, account_type, tag_id))
       # Save (commit) the changes
       conn.commit()
@@ -208,7 +208,8 @@ def load_url_queue(csvfilename, url_queue):
       ads_txt_url = 'http://{thehost}/ads.txt'.format(thehost=host)
       logging.info("  pushing %s" % ads_txt_url)
       filename = "adstxt_%03d.txt" % (len(queue.queue) + 1)
-      queue.put((ads_txt_url, filename))
+      crawl = Crawl(host, ads_txt_url, filename)
+      queue.put((ads_txt_url, crawl))
       cnt = cnt + 1
 
   return cnt
@@ -231,7 +232,7 @@ class WorkerThread(threading.Thread):
         print "An error occurred:", e.args[0]
     while 1:
       try:
-        url, filename = self.queue.get_nowait()
+        url, crawl = self.queue.get_nowait()
       except Queue.Empty:
         conn.commit()
         conn.close()
@@ -263,10 +264,10 @@ class WorkerThread(threading.Thread):
           logging.debug("%s" % retrieved_body)
           logging.debug("-------------")
 
-          if not effective_url.endswith("ads.txt"):
+          if "ads.txt" not in effective_url:
             continue;
 
-          tmpfile = filename
+          tmpfile = crawl.filename
           with open(tmpfile, 'wb') as tmp_csv_file:
             tmp_csv_file.write("%s" % retrieved_body)
             tmp_csv_file.close()
@@ -274,7 +275,7 @@ class WorkerThread(threading.Thread):
           if "<html" in "%s" % retrieved_body:
             continue
 
-          with open(filename, 'rU') as tmp_csv_file:
+          with open(tmpfile, 'rU') as tmp_csv_file:
             data_reader = csv.reader(
                 tmp_csv_file, delimiter=',', quotechar='|', strict=False)
 
@@ -282,8 +283,7 @@ class WorkerThread(threading.Thread):
               if len(row) == 0 or row[0].startswith('#'):
                 continue
 
-              #rowcnt = rowcnt +
-              process_row_to_db(conn, row, url)
+              process_row_to_db(conn, row, crawl)
       except:
         import traceback
         traceback.print_exc(file=sys.stderr)
@@ -303,6 +303,22 @@ class Storage:
 
   def __str__(self):
     return self.contents
+
+class Crawl:
+  def __init__(self, hostname, url, filename):
+    self.hostname = hostname
+    self.url = url
+    self.filename = filename
+
+  def host(self):
+    return host
+
+  def url(self):
+    return url
+
+  def filename(url):
+    return filename
+
 
 #### MAIN ####
 
